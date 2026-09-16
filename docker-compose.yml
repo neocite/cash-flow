@@ -1,0 +1,69 @@
+name: cashflow
+
+services:
+  mongo:
+    image: mongo:7.0
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27017:27017"]
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      # Initializes the replica set (required for transactions) and reports healthy once there is a PRIMARY
+      test: >
+        mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }; db.hello().isWritablePrimary || quit(1)"
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 5s
+
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=cashflow-local"]
+    ports: ["8085:8085"]
+
+  pubsub-init:
+    image: curlimages/curl:8.11.1
+    depends_on: [pubsub]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until curl -sf http://pubsub:8085/ >/dev/null; do echo "waiting for the emulator"; sleep 1; done
+        curl -sf -X PUT http://pubsub:8085/v1/projects/cashflow-local/topics/entries.recorded.v1
+        curl -sf -X PUT http://pubsub:8085/v1/projects/cashflow-local/subscriptions/daily-balance \
+          -H 'Content-Type: application/json' \
+          -d '{"topic":"projects/cashflow-local/topics/entries.recorded.v1","ackDeadlineSeconds":30}'
+    restart: "no"
+
+  entries:
+    build: ./services/entries
+    ports: ["3000:3000"]
+    environment: &app-env
+      PORT: 3000
+      MODE: all
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      GOOGLE_CLOUD_PROJECT: cashflow-local
+      PUBSUB_EMULATOR_HOST: pubsub:8085
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-do-not-use-in-production}
+    depends_on:
+      mongo: { condition: service_healthy }
+      pubsub-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health/ready"]
+      interval: 10s
+      retries: 10
+
+  balance:
+    build: ./services/balance
+    ports: ["3001:3001"]
+    environment:
+      <<: *app-env
+      PORT: 3001
+    depends_on:
+      mongo: { condition: service_healthy }
+      pubsub-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health/ready"]
+      interval: 10s
+      retries: 10
+
+volumes:
+  mongo-data:
